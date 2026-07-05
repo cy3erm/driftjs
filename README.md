@@ -1,5 +1,5 @@
 # driftjs
-
+![driftjs](driftjs-hero.png)
 Pulls a target's JavaScript apart for recon, and remembers what it saw last time so it can show you only what's new. Endpoints, secrets, interesting params, DOM XSS sinks, source maps, and the routes that got deleted from the current build but still live in old archived JS.
 
 The idea came from a simple thing every hunter runs into: JS files are where the real attack surface hides (API routes, hidden params, keys), but re-reading them by hand every time a site ships a new build is miserable. So driftjs snapshots what it finds and diffs it. First run is a baseline. Every run after tells you what changed, which is usually the stuff nobody's tested yet.
