@@ -1,0 +1,36 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "driftjs"
+dynamic = ["version"]
+description = "Watch a target's JavaScript for endpoints, secrets, and attack surface, and diff what's new over time."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [{ name = "cy3erm" }]
+keywords = ["bug-bounty", "recon", "javascript", "endpoints", "security", "appsec"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Environment :: Console",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3 :: Only",
+    "Topic :: Security",
+]
+dependencies = []
+
+[project.urls]
+Homepage = "https://github.com/cy3erm/driftjs"
+Repository = "https://github.com/cy3erm/driftjs"
+Issues = "https://github.com/cy3erm/driftjs/issues"
+
+[project.scripts]
+driftjs = "driftjs.cli:main"
+
+[tool.setuptools]
+packages = ["driftjs"]
+
+[tool.setuptools.dynamic]
+version = { attr = "driftjs.__version__" }
