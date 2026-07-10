@@ -7,7 +7,7 @@ import sys
 
 from .extract import Extraction, extract
 from .fetch import gather_js
-from .snapshot import diff, load_latest, save_snapshot
+from .snapshot import diff, load_latest, save_snapshot, update_seen
 from .analyze import interesting_params, interesting_endpoints
 
 DEFAULT_STATE = os.path.expanduser("~/.driftjs")
@@ -39,7 +39,7 @@ def _key(cat, item):
 
 _TRACKED = ["endpoints", "params", "secrets", "cloud", "notable", "weaknesses",
             "sinks", "sourcemaps", "libraries", "comments", "internal_hosts",
-            "websockets", "source_files"]
+            "websockets", "source_files", "graphql_ops", "routes"]
 
 
 def _record(origins, ex, src):
@@ -60,7 +60,7 @@ def _src(origins, cat, item):
 
 def run(target, state_dir, label=None, wayback=False, as_json=False, wordlist=None,
         probe=False, scope=None, probe_delay=0.5, compact=False, maps=False, html_out=None, cve=False,
-        since_last=False, only=None, exclude=None):
+        since_last=False, only=None, exclude=None, rank=False, curl=False):
     key = label or target
     if not as_json and not compact:
         print(f"[*] gathering JS for {target}")
@@ -85,6 +85,8 @@ def run(target, state_dir, label=None, wayback=False, as_json=False, wordlist=No
     previous = load_latest(state_dir, key)
     d = diff(previous, current)
     save_snapshot(state_dir, key, current)
+    now = int(time.time())
+    seen, fresh = update_seen(state_dir, key, current.endpoints, now)
 
     if wordlist:
         _write_wordlist(wordlist, current)
@@ -97,7 +99,7 @@ def run(target, state_dir, label=None, wayback=False, as_json=False, wordlist=No
             print(_c(f"[=] HTML report written to {html_out}", "36"))
 
     if as_json:
-        return _build_json(target, current, d, origins)
+        return _build_json(target, current, d, origins, fresh, now)
 
     if since_last:
         _print_since_last(target, d, origins)
@@ -147,8 +149,13 @@ def run(target, state_dir, label=None, wayback=False, as_json=False, wordlist=No
         rows = sorted(current.weaknesses, key=lambda w: order.get(w[0], 3))
         print(_c(f"\n[!] {len(rows)} potential weakness(es) — leads to verify, not confirmed bugs:", "31;1"))
         color = {"high": "31;1", "medium": "33", "low": "90"}
+        from .explain import explain
         for sev, label in rows:
             print(_c(f"    [{sev.upper()}] {label}", color.get(sev, "37")) + _src(origins, "weaknesses", (sev, label)))
+            info = explain(label)
+            if info:
+                print(_c(f"        why:    {info['why']}", "90"))
+                print(_c(f"        verify: {info['verify']}", "90"))
 
     if show("libraries") and current.libraries:
         vuln = [x for x in current.libraries if x[2]]
@@ -173,6 +180,21 @@ def run(target, state_dir, label=None, wayback=False, as_json=False, wordlist=No
         for w in sorted(current.websockets):
             print(_c(f"    ~ {w}", "36") + _src(origins, "websockets", w))
 
+    if show("graphql_ops") and current.graphql_ops:
+        muts = sorted(o for o in current.graphql_ops if o.startswith("mutation"))
+        rest = sorted(o for o in current.graphql_ops if not o.startswith("mutation"))
+        print(_c(f"\n[*] {len(current.graphql_ops)} GraphQL operation(s)"
+                 f"{f' — {len(muts)} mutation(s)' if muts else ''}:", "36;1"))
+        for o in muts:
+            print(_c(f"    ! {o}", "31") + _src(origins, "graphql_ops", o))
+        for o in rest:
+            print(_c(f"    > {o}", "36") + _src(origins, "graphql_ops", o))
+
+    if show("routes") and current.routes:
+        print(_c(f"\n[*] {len(current.routes)} client-side route(s) (may be gated only in the browser):", "34;1"))
+        for r in sorted(current.routes):
+            print(_c(f"    > {r}", "34") + _src(origins, "routes", r))
+
     if show("comments") and current.comments:
         print(_c(f"\n[*] {len(current.comments)} developer comment(s) of interest:", "35"))
         for c in sorted(current.comments)[:25]:
@@ -182,7 +204,13 @@ def run(target, state_dir, label=None, wayback=False, as_json=False, wordlist=No
     if show("endpoints") and hot_e:
         print(_c(f"\n[*] {len(hot_e)} interesting endpoint(s):", "33;1"))
         for e in sorted(hot_e):
-            print(_c(f"    > {e}", "33") + _src(origins, "endpoints", e))
+            print(_c(f"    > {e}", "33") + _fresh_tag(e, fresh, now) + _src(origins, "endpoints", e))
+
+    if rank:
+        _print_rank(current, fresh, now, origins)
+
+    if curl:
+        _print_curl(target, current)
 
     hot_p = interesting_params(current.params)
     if hot_p:
@@ -220,7 +248,7 @@ def run(target, state_dir, label=None, wayback=False, as_json=False, wordlist=No
 
     ghosts = []
     if wayback:
-        ghosts = _run_wayback(target, current)
+        ghosts = _run_wayback(target, current) or []
 
     if probe:
         _run_probe(target, current, d, ghosts, scope or [], probe_delay)
@@ -275,8 +303,51 @@ def _json_val(items):
     return [list(x) if isinstance(x, tuple) else x for x in items]
 
 
-def _build_json(target, ex, d, origins):
+def _fresh_tag(endpoint, fresh, now):
+    ts = fresh.get(endpoint)
+    if ts is None:
+        return ""
+    from .rank import age_str
+    age = age_str(now - ts)
+    code = "32;1" if (now - ts) < 7 * 86400 else "32"
+    return _c(f"  (new, seen {age} ago)", code)
+
+
+def _print_rank(current, fresh, now, origins):
+    from .rank import rank_endpoints
+    ranked = rank_endpoints(current.endpoints)
+    if not ranked:
+        return
+    shown = ranked[:25]
+    print(_c(f"\n[#] ranked attack surface (top {len(shown)} of {len(ranked)}) — leads to verify:", "36;1"))
+    for score, ep, reasons in shown:
+        print(_c(f"    [{score}] {ep}", "33;1") + _fresh_tag(ep, fresh, now) + _src(origins, "endpoints", ep))
+        print(_c(f"        {'; '.join(reasons)}", "90"))
+
+
+def _print_curl(target, current):
+    from urllib.parse import urlparse
+    from .rank import rank_endpoints
+    from .curl import curl_for, headers_from_notable
+    if not urlparse(target).netloc:
+        print(_c("\n[!] --curl needs a URL target with a host (skipped).", "33"))
+        return
+    ranked = rank_endpoints(current.endpoints)
+    eps = [e for _, e, _ in ranked[:25]] or sorted(interesting_endpoints(current.endpoints))[:25]
+    if not eps:
+        print(_c("\n[=] nothing worth a curl PoC yet.", "90"))
+        return
+    hdrs = headers_from_notable(current.notable)
+    print(_c(f"\n[$] curl PoCs for {len(eps)} endpoint(s) (FUZZ/$TOKEN are placeholders — authorized targets only):", "36;1"))
+    for e in eps:
+        print(_c("\n# " + e, "90"))
+        print(curl_for(target, e, hdrs))
+
+
+def _build_json(target, ex, d, origins, fresh=None, now=None):
     from .snapshot import _DIFF_CATS
+    from .rank import rank_endpoints
+    fresh = fresh or {}
     src_map = {f"{cat}:{val}": sorted(files) for (cat, val), files in origins.items()}
     obj = {
         "target": target,
@@ -284,6 +355,10 @@ def _build_json(target, ex, d, origins):
         "params": sorted(ex.params),
         "interesting_endpoints": sorted(interesting_endpoints(ex.endpoints)),
         "interesting_params": sorted(interesting_params(ex.params)),
+        "ranked": [{"endpoint": e, "score": s, "reasons": r, "fresh": e in fresh}
+                   for s, e, r in rank_endpoints(ex.endpoints)],
+        "fresh_endpoints": sorted(fresh),
+        "first_seen": {e: fresh[e] for e in sorted(fresh)},
         "secrets": sorted(list(s) for s in ex.secrets),
         "cloud": sorted(list(c) for c in ex.cloud),
         "notable": sorted(ex.notable),
@@ -293,6 +368,8 @@ def _build_json(target, ex, d, origins):
         "internal_hosts": sorted(ex.internal_hosts),
         "websockets": sorted(ex.websockets),
         "source_files": sorted(ex.source_files),
+        "graphql_ops": sorted(ex.graphql_ops),
+        "routes": sorted(ex.routes),
         "sinks": sorted(ex.sinks),
         "sourcemaps": sorted(ex.sourcemaps),
         "sources": src_map,
@@ -311,13 +388,13 @@ def _run_wayback(target, current):
     domain = urlparse(target).netloc or target.split("/")[0]
     if not domain or "." not in domain:
         print(_c("\n[!] --wayback needs a domain/URL target (skipped).", "33"))
-        return
+        return []
     print(_c(f"\n[*] pulling archived JS for {domain} from the Wayback Machine...", "36"))
     try:
         hist = historical_endpoints(domain)
     except Exception as e:
         print(_c(f"[!] wayback lookup failed: {e}", "33"))
-        return
+        return []
     ghosts = sorted(hist.endpoints - current.endpoints)
     if ghosts:
         print(_c(f"\n[G] {len(ghosts)} GHOST endpoint(s) — in old builds, gone from current JS:", "35;1"))
@@ -392,7 +469,8 @@ def _print_since_last(target, d, origins):
         "sinks": ("· sink", "90"), "sourcemaps": ("~ sourcemap", "36"),
         "libraries": ("· library", "36"), "comments": ("// comment", "35"),
         "internal_hosts": ("> host", "33"), "websockets": ("~ websocket", "36"),
-        "source_files": ("~ source", "36"),
+        "source_files": ("~ source", "36"), "graphql_ops": ("> graphql", "36"),
+        "routes": ("> route", "34"),
     }
     any_change = False
     for cat in _DIFF_CATS:
@@ -439,7 +517,8 @@ def _scan_targets(targets, args):
             result = run(t, args.state, label, args.wayback, args.json, wordlist,
                          args.probe, args.scope, args.probe_delay, compact=many,
                          maps=args.maps, html_out=html_out, cve=args.cve,
-                         since_last=args.since_last, only=args.only, exclude=args.exclude)
+                         since_last=args.since_last, only=args.only, exclude=args.exclude,
+                         rank=args.rank, curl=args.curl)
         except SystemExit as e:
             if many:
                 print(_c(f"[!] {t}: {e}", "33"))
@@ -581,6 +660,10 @@ def main():
     p.add_argument("--cve", action="store_true", help="look up real CVEs for detected libraries via the OSV database (live)")
     p.add_argument("--ndjson", action="store_true", help="in multi-target JSON mode, emit one JSON object per line")
     p.add_argument("--since-last", action="store_true", dest="since_last", help="print only what is new/changed since the last snapshot")
+    p.add_argument("--rank", action="store_true",
+                   help="rank endpoints by likely bug value (IDOR/SSRF/sensitive actions) and show why")
+    p.add_argument("--curl", action="store_true",
+                   help="print ready-to-run curl PoC commands for the top-ranked endpoints")
     p.add_argument("--only", help="show only these sections (comma-separated: secrets,endpoints,weaknesses,...)")
     p.add_argument("--exclude", help="hide these sections (comma-separated)")
     p.add_argument("--webhook", metavar="URL",
@@ -612,7 +695,8 @@ def main():
             print_banner()
         result = run(args.target, args.state, args.label, args.wayback, args.json, args.wordlist,
                      args.probe, args.scope, args.probe_delay, maps=args.maps, html_out=args.html, cve=args.cve,
-                     since_last=args.since_last, only=args.only, exclude=args.exclude)
+                     since_last=args.since_last, only=args.only, exclude=args.exclude,
+                     rank=args.rank, curl=args.curl)
         if args.json and result is not None:
             print(_json.dumps(result, indent=2))
         return

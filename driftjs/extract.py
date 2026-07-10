@@ -1,6 +1,9 @@
 import re
 from dataclasses import dataclass, field
 
+from .headers import (find_header_keys, find_interesting_headers,
+                      NOTABLE_HEADER_PREFIX, UNAMBIGUOUS_HEADER_WORDS)
+
 
 _PATH = re.compile(r"""['"`](/(?!/)[a-zA-Z0-9_\-./${}:]{1,120}(?:\?[a-zA-Z0-9_\-=&%.]{0,120})?)['"`]""")
 
@@ -16,6 +19,12 @@ _KEY_STOP = frozenset({
     "type", "props", "state", "context", "width", "height", "margin", "padding",
     "color", "background", "border", "display", "position", "class", "id",
     "onclick", "onchange", "onsubmit", "value", "label", "title", "name",
+    # fetch()/axios request-init option keys — these are config, not params
+    "method", "headers", "body", "mode", "credentials", "cache", "redirect",
+    "referrer", "referrerpolicy", "signal", "keepalive", "integrity", "window",
+    "params", "data", "responsetype", "withcredentials", "timeout", "baseurl",
+    "path", "component", "loader", "lazy", "errorelement", "casesensitive",
+    "handle", "element",
 })
 
 
@@ -51,6 +60,8 @@ class Extraction:
     internal_hosts: set = field(default_factory=set)
     websockets: set = field(default_factory=set)
     source_files: set = field(default_factory=set)
+    graphql_ops: set = field(default_factory=set)
+    routes: set = field(default_factory=set)
 
     def merge(self, other: "Extraction") -> None:
         self.endpoints |= other.endpoints
@@ -66,6 +77,8 @@ class Extraction:
         self.internal_hosts |= other.internal_hosts
         self.websockets |= other.websockets
         self.source_files |= other.source_files
+        self.graphql_ops |= other.graphql_ops
+        self.routes |= other.routes
 
 
 _SEG_NUM = re.compile(r"/\d+(?=/|$)")
@@ -126,19 +139,39 @@ def extract(js: str) -> Extraction:
         if len(k) >= 3 and k.lower() not in _KEY_STOP and re.fullmatch(r"[a-z][a-zA-Z0-9_]{2,}", k):
             out.params.add(k)
 
+    # Headers are not fuzzable request params. Drop every key declared inside a
+    # headers:{...} block, plus unambiguous header words and query-string tokens
+    # that are really header names, so results stay signal, not noise.
+    # A key seen inside a real headers block is definitely a header (even an
+    # ambiguous word like "location"); the curated word list catches distinctive
+    # header names elsewhere. Ambiguous words outside a header block survive,
+    # since they are plausible data fields.
+    header_keys = find_header_keys(js)
+    out.params = {
+        p for p in out.params
+        if p.lower() not in header_keys
+        and p.lower() not in UNAMBIGUOUS_HEADER_WORDS
+    }
+
     from .secrets import find_secrets
     from .analyze import (find_sinks, find_sourcemaps, find_cloud_assets, find_notable,
                           find_dev_comments, find_internal_hosts, find_websockets)
     from .weaknesses import find_weaknesses
     from .libraries import find_libraries
+    from .graphql import find_graphql_ops
+    from .routes import find_routes
     out.secrets = find_secrets(js)
     out.sinks = find_sinks(js)
     out.sourcemaps = find_sourcemaps(js)
     out.cloud = find_cloud_assets(js)
     out.notable = find_notable(js)
+    for hdr, why in find_interesting_headers(js):
+        out.notable.add(f"{NOTABLE_HEADER_PREFIX}{hdr} ({why})")
     out.weaknesses = find_weaknesses(js)
     out.libraries = find_libraries(js)
     out.comments = find_dev_comments(js)
     out.internal_hosts = find_internal_hosts(js)
     out.websockets = find_websockets(js)
+    out.graphql_ops = find_graphql_ops(js)
+    out.routes = find_routes(js)
     return out

@@ -31,17 +31,28 @@ def render_report(target, ex, origins=None):
                for l, r in sorted(ex.secrets)]
     cloud = [f'<span class="bad">{_esc(l)}</span>: <code>{_esc(v)}</code>{src("cloud", v)}'
              for l, v in sorted(ex.cloud)]
+    from .explain import explain
     weaknesses = []
     for sev, label in sorted(ex.weaknesses, key=lambda w: {"high": 0, "medium": 1, "low": 2}.get(w[0], 3)):
         c = sev_color.get(sev, "#999")
-        weaknesses.append(f'<span style="color:{c};font-weight:600">[{_esc(sev.upper())}]</span> '
-                          f'{_esc(label)}{src("weaknesses", label)}')
+        row = (f'<span style="color:{c};font-weight:600">[{_esc(sev.upper())}]</span> '
+               f'{_esc(label)}{src("weaknesses", label)}')
+        info = explain(label)
+        if info:
+            row += (f'<div class="detail"><b>Why:</b> {_esc(info["why"])}<br>'
+                    f'<b>Verify:</b> {_esc(info["verify"])}</div>')
+        weaknesses.append(row)
     libs = []
     for name, ver, note in sorted(ex.libraries):
         if note:
             libs.append(f'<span class="bad">{_esc(name)} {_esc(ver)}</span> &mdash; {_esc(note)}')
         else:
             libs.append(f'{_esc(name)} {_esc(ver)}')
+    gql = []
+    for o in sorted(ex.graphql_ops):
+        cls = "bad" if o.startswith("mutation") else "src"
+        gql.append(f'<span class="{cls}">{_esc(o)}</span>{src("graphql_ops", o)}')
+    routes = [f'<code>{_esc(r)}</code>{src("routes", r)}' for r in sorted(ex.routes)]
     interesting = [f'<code>{_esc(e)}</code>{src("endpoints", e)}'
                    for e in sorted(_interesting(ex.endpoints))]
     notable = [f'{_esc(n)}{src("notable", n)}' for n in sorted(ex.notable)]
@@ -56,6 +67,8 @@ def render_report(target, ex, origins=None):
         _section("Potential weaknesses (verify)", weaknesses, "#e44628"),
         _section("Libraries", libs, "#d8a800"),
         _section("Interesting endpoints", interesting, "#d8a800"),
+        _section("GraphQL operations", gql, "#38d1d7"),
+        _section("Client-side routes", routes, "#7a9fd0"),
         _section("Notable signals", notable, "#b46fd0"),
         _section("Internal hosts / IPs", hosts, "#d8a800"),
         _section("WebSockets", ws, "#38d1d7"),
@@ -92,6 +105,8 @@ _TEMPLATE = """<!doctype html>
  code{{color:#9fd0d5}}
  .bad{{color:#e44628;font-weight:600}}
  .src{{color:#5a5c64;font-size:12px}}
+ .detail{{color:#9a9ca4;font-size:12.5px;line-height:1.55;margin:6px 0 2px;padding-left:12px;border-left:2px solid #26272d}}
+ .detail b{{color:#c2c4cc}}
  footer{{margin-top:40px;color:#5a5c64;font-size:12px}}
 </style></head>
 <body><div class="wrap">

@@ -47,12 +47,15 @@ $ driftjs https://target.com
 - **Secrets** — ~60 patterns: AWS, Google, Firebase, Stripe, OpenAI, Anthropic, Discord, Telegram, Cloudflare, GitHub, GitLab, Slack, Twilio, SendGrid, Notion, Linear, Supabase, and more, plus JWTs and private keys. It also flags high-entropy strings assigned to secret-like names (catching unknown providers) and decodes base64 blobs to find keys hidden inside them.
 - **Cloud assets** — S3 buckets, GCS buckets, Azure blobs, DigitalOcean Spaces, Firebase Storage (worth checking for public/misconfigured access)
 - **Notable signals** — SSRF/cloud-metadata targets (`169.254.169.254`), hardcoded Bearer/Basic auth, `localStorage` token access, GraphQL introspection, debug flags
-- **Weakness indicators** — high-signal insecure patterns worth investigating: DOM XSS source-to-sink chains, `postMessage` handlers with no origin check, client-side authorization logic, prototype-pollution sinks, weak crypto (MD5/SHA1/DES), `alg: none` JWTs, `Math.random()` in security contexts, insecure `http://` URLs. Graded high/medium/low, and framed as leads to verify — not confirmed bugs.
+- **Weakness indicators** — high-signal insecure patterns worth investigating: DOM XSS source-to-sink chains, `postMessage` handlers with no origin check, client-side authorization logic, prototype-pollution sinks, weak crypto (MD5/SHA1/DES), `alg: none` JWTs, `Math.random()` in security contexts, insecure `http://` URLs. Graded high/medium/low, and framed as leads to verify — not confirmed bugs. Each one now ships with a plain-English **why it matters** and a concrete **how to verify** line, in both the terminal output and the HTML report.
 - **Vulnerable libraries** — detects JS library versions (jQuery, lodash, AngularJS, Bootstrap, Handlebars, and more) and flags known-vulnerable versions. With `--cve` it queries the OSV vulnerability database live and lists the real CVEs/advisories affecting each detected version.
 - **Developer comments** — surfaces `TODO`, `FIXME`, `HACK`, and notes mentioning passwords, secrets, "hardcoded", "insecure", "internal only", and similar — the kind of thing devs leave in bundles by accident.
 - **Internal hosts & private IPs** — flags `*.internal` / `*.corp` / `*.staging` hostnames and RFC-1918 IPs (10.x, 192.168.x, 172.16–31.x) that leak internal infrastructure.
 - **WebSocket endpoints** — `ws://` / `wss://` URLs, an attack surface that's easy to miss.
-- **Interesting params** — the ones worth fuzzing: `redirect`, `url`, `debug`, `admin`, `token`, `callback`, etc. (open-redirect / SSRF / IDOR signals)
+- **GraphQL operations** — named `query`/`mutation`/`subscription` operations pulled from bundles and `gql` template literals, with mutations flagged as higher-value. Router/DOM lookalikes like `db.query()` and `MutationObserver` are ignored.
+- **Client-side routes** — React Router / Vue Router / Angular route paths, including admin routes gated only in the browser. Only mined from bundles that actually ship a client router, so paths are never guessed.
+- **Interesting params** — the ones worth fuzzing: `redirect`, `url`, `debug`, `admin`, `token`, `callback`, etc. (open-redirect / SSRF / IDOR signals). Params are now cleaned of noise: HTTP header names (`Content-Type`, `X-Accept`, `Authorization`, custom `x-*`, …) and `fetch`/`axios` request-init keys (`method`, `headers`, `body`, `credentials`, …) no longer leak in as fake parameters.
+- **Request headers** — security-relevant headers seen in `headers:{…}` blocks are surfaced as signals instead of noise: auth material (`Authorization`, `X-Api-Key`), CSRF tokens, tenant/account/org scoping headers (IDOR surface), and routing headers used for host-header / SSRF / method-override tricks (`X-Forwarded-Host`, `X-Original-URL`, `X-HTTP-Method-Override`, …).
 - **Interesting endpoints** — `/admin`, `/internal`, `/graphql`, `/swagger`, `/api-docs`, `/actuator`, api versions, and other high-value paths
 - **DOM XSS sinks** — `innerHTML`, `eval`, `document.write`, `dangerouslySetInnerHTML`, and friends
 - **Source maps** — flags `sourceMappingURL` refs, and with `--maps` it fetches the `.map` files and recovers the original, un-minified source: real file paths, variable names, comments, and dev-only modules, all re-scanned for endpoints, secrets, and everything else.
@@ -85,6 +88,8 @@ Options:
 driftjs https://target.com --wayback          # also surface deleted/archived endpoints
 driftjs https://target.com --maps             # recover original source from source maps
 driftjs https://target.com --cve              # look up real CVEs for detected libraries (OSV)
+driftjs https://target.com --rank             # rank endpoints by likely bug value (IDOR/SSRF/sensitive actions)
+driftjs https://target.com --curl             # ready-to-run curl PoCs for the top-ranked endpoints
 driftjs https://target.com --all              # everything passive at once (wayback + maps)
 driftjs https://target.com --html report.html # write a shareable HTML report
 driftjs https://target.com --watch 3600       # re-check hourly, alert on anything new

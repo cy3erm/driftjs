@@ -1,3 +1,4 @@
+import base64
 import re
 
 _RULES = [
@@ -141,7 +142,6 @@ def find_secrets(js):
         if len(blob) > 4000:
             continue
         try:
-            import base64
             decoded = base64.b64decode(blob + "===", validate=False).decode("utf-8", "ignore")
         except Exception:
             continue

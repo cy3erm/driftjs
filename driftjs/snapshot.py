@@ -36,7 +36,9 @@ def load_latest(base: str, target: str) -> Extraction | None:
                       comments=set(data.get("comments", [])),
                       internal_hosts=set(data.get("internal_hosts", [])),
                       websockets=set(data.get("websockets", [])),
-                      source_files=set(data.get("source_files", [])))
+                      source_files=set(data.get("source_files", [])),
+                      graphql_ops=set(data.get("graphql_ops", [])),
+                      routes=set(data.get("routes", [])))
 
 
 def save_snapshot(base: str, target: str, ex: Extraction) -> None:
@@ -57,17 +59,51 @@ def save_snapshot(base: str, target: str, ex: Extraction) -> None:
         "internal_hosts": sorted(ex.internal_hosts),
         "websockets": sorted(ex.websockets),
         "source_files": sorted(ex.source_files),
+        "graphql_ops": sorted(ex.graphql_ops),
+        "routes": sorted(ex.routes),
     }
     stamp = time.strftime("%Y%m%d-%H%M%S")
-    with open(os.path.join(d, f"{stamp}.json"), "w") as f:
+    hist = os.path.join(d, f"{stamp}.json")
+    n = 1
+    while os.path.exists(hist):
+        hist = os.path.join(d, f"{stamp}-{n}.json")
+        n += 1
+    with open(hist, "w") as f:
         json.dump(payload, f, indent=2)
     with open(os.path.join(d, "latest.json"), "w") as f:
         json.dump(payload, f, indent=2)
 
 
+def load_seen(base: str, target: str) -> dict:
+    d = _state_dir(base, target)
+    path = os.path.join(d, "seen.json")
+    if not os.path.exists(path):
+        return {"baseline_ts": None, "endpoints": {}}
+    with open(path) as f:
+        data = json.load(f)
+    data.setdefault("baseline_ts", None)
+    data.setdefault("endpoints", {})
+    return data
+
+
+def update_seen(base: str, target: str, endpoints, now: int) -> tuple[dict, dict]:
+    seen = load_seen(base, target)
+    if seen["baseline_ts"] is None:
+        seen["baseline_ts"] = now
+    baseline = seen["baseline_ts"]
+    prior = seen["endpoints"]
+    current = {e: int(prior.get(e, now)) for e in endpoints}
+    seen["endpoints"] = current
+    d = _state_dir(base, target)
+    with open(os.path.join(d, "seen.json"), "w") as f:
+        json.dump(seen, f, indent=2)
+    fresh = {e: ts for e, ts in current.items() if ts > baseline}
+    return seen, fresh
+
+
 _DIFF_CATS = ["endpoints", "params", "secrets", "cloud", "notable", "weaknesses",
               "sinks", "sourcemaps", "libraries", "comments", "internal_hosts",
-              "websockets", "source_files"]
+              "websockets", "source_files", "graphql_ops", "routes"]
 
 
 @dataclass

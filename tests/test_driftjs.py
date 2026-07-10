@@ -601,3 +601,343 @@ def test_fetch_modern_discovery():
     assert any("a.JS" in u for u in urls)
     assert any("b.mjs" in u for u in urls)
     assert any("c.js" in u for u in urls)
+
+
+# ---- v1.2.0: header noise filtering ----
+
+def test_fetch_init_keys_not_params():
+    from driftjs.extract import extract
+    ex = extract("fetch('/api/x', { method: 'POST', headers: {}, body: b, credentials: 'include' });")
+    for junk in ("method", "headers", "body", "credentials"):
+        assert junk not in ex.params
+
+
+def test_header_block_keys_not_params():
+    from driftjs.extract import extract
+    js = ("fetch(u, { headers: { 'Content-Type': 'application/json', "
+          "'X-Accept': 'v1', 'authorization': t, 'x-custom-flag': 1 } });")
+    for hdr in ("content", "accept", "authorization", "x-accept", "x-custom-flag"):
+        assert hdr not in {p.lower() for p in ex_params(js)}
+
+
+def ex_params(js):
+    from driftjs.extract import extract
+    return extract(js).params
+
+
+def test_unambiguous_header_word_dropped():
+    from driftjs.extract import extract
+    ex = extract("const o = { authorization: a, cookie: c, userId: u };")
+    assert "authorization" not in ex.params
+    assert "cookie" not in ex.params
+    assert "userId" in ex.params  # real param survives
+
+
+def test_ambiguous_word_survives_as_param():
+    from driftjs.extract import extract
+    # 'location' and 'date' are also header names but plausibly real params
+    ex = extract("const o = { location: l, date: d };")
+    assert "location" in ex.params and "date" in ex.params
+
+
+def test_interesting_header_promoted_to_notable():
+    from driftjs.extract import extract
+    js = "fetch(u, { headers: { 'X-Api-Key': k, 'x-tenant-id': t } });"
+    ex = extract(js)
+    joined = " ".join(ex.notable).lower()
+    assert "x-api-key" in joined
+    assert "x-tenant-id" in joined
+
+
+def test_header_block_brace_matching():
+    from driftjs.headers import find_header_keys
+    js = "req({ headers: { 'X-A': 1, nested: { 'X-B': 2 } }, method: 'GET' });"
+    keys = find_header_keys(js)
+    assert "x-a" in keys and "x-b" in keys
+    assert "method" not in keys  # outside the headers block
+
+
+def test_is_header_custom_prefixes():
+    from driftjs.headers import is_header
+    assert is_header("X-Whatever")
+    assert is_header("sec-fetch-mode")
+    assert is_header("access-control-allow-origin")
+    assert not is_header("userId")
+
+
+# ---- v1.2.0: weakness explanations ----
+
+def test_every_weakness_label_has_explanation():
+    from driftjs.explain import explain
+    from driftjs.weaknesses import _CHECKS_SIMPLE
+    dynamic = [
+        "DOM XSS chain: untrusted source flows toward an HTML/JS sink",
+        "Math.random() used in a security context (not cryptographically safe)",
+        "Insecure http:// URL (mixed content / MITM exposure)",
+    ]
+    labels = [label for _, label, _ in _CHECKS_SIMPLE] + dynamic
+    for label in labels:
+        info = explain(label)
+        assert info and info.get("why") and info.get("verify"), f"missing explanation: {label}"
+
+
+def test_explain_unknown_label_returns_none():
+    from driftjs.explain import explain
+    assert explain("not a real weakness") is None
+
+
+# ---- v1.2.1: bug fixes ----
+
+def test_header_block_with_brace_in_string_value():
+    from driftjs.headers import find_header_keys
+    js = 'fetch(u, { headers: { "X-Foo": "a}b", "X-Secret-Param": tok }, method: "GET" })'
+    keys = find_header_keys(js)
+    assert "x-foo" in keys
+    assert "x-secret-param" in keys
+
+
+def test_brace_in_string_header_does_not_leak_as_param():
+    js = 'fetch(u, { headers: { "X-Foo": "a}b", "X-Custom-Token": tok } })'
+    ex = extract(js)
+    assert not any("custom-token" in p.lower() for p in ex.params)
+
+
+def test_real_data_param_survives_near_string_brace():
+    js = 'const s = "}"; fetch("/api?userId=1"); const body = { userId: id };'
+    ex = extract(js)
+    assert "userId" in ex.params
+
+
+def test_wayback_returns_empty_list_on_bad_domain():
+    from driftjs import cli
+    from driftjs.extract import Extraction
+    assert cli._run_wayback("localhost", Extraction()) == []
+
+
+def test_wayback_returns_empty_list_on_lookup_failure(monkeypatch):
+    from driftjs import cli
+    import driftjs.wayback as wb
+    from driftjs.extract import Extraction
+
+    def boom(domain):
+        raise RuntimeError("network down")
+
+    monkeypatch.setattr(wb, "historical_endpoints", boom)
+    assert cli._run_wayback("https://example.com", Extraction()) == []
+
+
+def test_decode_body_plain_passthrough():
+    from driftjs.fetch import _decode_body
+    assert _decode_body(b'fetch("/api/x")') == 'fetch("/api/x")'
+
+
+def test_decode_body_gzip_by_magic_bytes():
+    import gzip
+    from driftjs.fetch import _decode_body
+    raw = gzip.compress(b'fetch("/api/y")')
+    assert _decode_body(raw) == 'fetch("/api/y")'
+
+
+def test_decode_body_gzip_by_content_encoding():
+    import gzip
+    from driftjs.fetch import _decode_body
+    raw = gzip.compress(b'axios.get("/api/z")')
+    assert _decode_body(raw, "gzip") == 'axios.get("/api/z")'
+
+
+def test_snapshot_history_does_not_overwrite_same_second(tmp_path, monkeypatch):
+    import os
+    import driftjs.snapshot as snap
+    from driftjs.extract import Extraction
+
+    monkeypatch.setattr(snap.time, "strftime", lambda *a, **k: "20260101-000000")
+    snap.save_snapshot(str(tmp_path), "t.example.com", Extraction(endpoints={"/a"}))
+    snap.save_snapshot(str(tmp_path), "t.example.com", Extraction(endpoints={"/a", "/b"}))
+    d = snap._state_dir(str(tmp_path), "t.example.com")
+    hist = [f for f in os.listdir(d) if f.endswith(".json") and f != "latest.json" and f != "target.txt"]
+    assert len(hist) == 2
+
+
+# ---- v1.3.0: ranking, first-seen, curl PoCs ----
+
+def test_rank_scores_idor_and_sensitive_action():
+    from driftjs.rank import score_endpoint
+    score, reasons = score_endpoint("/api/v1/admin/transfer?userId&amount")
+    assert score > 0
+    joined = " ".join(reasons).lower()
+    assert "api route" in joined
+    assert "sensitive action" in joined
+    assert "idor" in joined
+
+
+def test_rank_stays_silent_on_benign_paths():
+    from driftjs.rank import score_endpoint
+    for benign in ["/about", "/contact", "/home", "/blog/post"]:
+        score, reasons = score_endpoint(benign)
+        assert score == 0, f"benign path scored: {benign}"
+        assert reasons == []
+
+
+def test_rank_orders_higher_value_first():
+    from driftjs.rank import rank_endpoints
+    ranked = rank_endpoints({"/about", "/api/v1/users?id", "/api/v1/payout?accountId"})
+    eps = [e for _, e, _ in ranked]
+    assert "/about" not in eps
+    assert eps[0] == "/api/v1/payout?accountId"
+
+
+def test_rank_redirect_param_flagged():
+    from driftjs.rank import score_endpoint
+    score, reasons = score_endpoint("/login?redirect")
+    assert score > 0
+    assert any("redirect" in r.lower() for r in reasons)
+
+
+def test_first_seen_nothing_fresh_on_baseline(tmp_path):
+    from driftjs.snapshot import update_seen
+    seen, fresh = update_seen(str(tmp_path), "t.example.com", {"/a", "/b"}, now=1000)
+    assert fresh == {}
+    assert seen["baseline_ts"] == 1000
+
+
+def test_first_seen_flags_endpoint_added_after_baseline(tmp_path):
+    from driftjs.snapshot import update_seen
+    update_seen(str(tmp_path), "t.example.com", {"/a", "/b"}, now=1000)
+    seen, fresh = update_seen(str(tmp_path), "t.example.com", {"/a", "/b", "/c"}, now=5000)
+    assert set(fresh) == {"/c"}
+    assert fresh["/c"] == 5000
+    assert seen["endpoints"]["/a"] == 1000
+
+
+def test_first_seen_prunes_gone_endpoints(tmp_path):
+    from driftjs.snapshot import update_seen
+    update_seen(str(tmp_path), "t.example.com", {"/a", "/b"}, now=1000)
+    seen, _ = update_seen(str(tmp_path), "t.example.com", {"/a"}, now=2000)
+    assert set(seen["endpoints"]) == {"/a"}
+
+
+def test_age_str_units():
+    from driftjs.rank import age_str
+    assert age_str(120) == "2m"
+    assert age_str(7200) == "2h"
+    assert age_str(3 * 86400) == "3d"
+
+
+def test_curl_builds_fuzzable_request():
+    from driftjs.curl import curl_for
+    out = curl_for("https://target.com", "/api/v1/users/{id}?userId&debug",
+                   [("Authorization", "Bearer $TOKEN"), ("X-Tenant-Id", "FUZZ")])
+    assert "curl -s -X GET 'https://target.com/api/v1/users/1?userId=FUZZ&debug=FUZZ'" in out
+    assert "-H 'Authorization: Bearer $TOKEN'" in out
+    assert "-H 'X-Tenant-Id: FUZZ'" in out
+
+
+def test_headers_from_notable_parses_and_adds_auth():
+    from driftjs.curl import headers_from_notable
+    from driftjs.headers import NOTABLE_HEADER_PREFIX
+    notable = {
+        f"{NOTABLE_HEADER_PREFIX}X-Api-Key (API key header)",
+        f"{NOTABLE_HEADER_PREFIX}X-Tenant-Id (tenant scoping (IDOR / tenant-isolation surface))",
+        "Hardcoded Bearer token",
+    }
+    hdrs = dict(headers_from_notable(notable))
+    assert hdrs["X-Api-Key"] == "$API_KEY"
+    assert hdrs["X-Tenant-Id"] == "FUZZ"
+    assert hdrs["Authorization"] == "Bearer $TOKEN"
+
+
+def test_headers_from_notable_silent_without_signals():
+    from driftjs.curl import headers_from_notable
+    assert headers_from_notable({"GraphQL introspection query", "Debug flag enabled"}) == []
+
+
+def test_notable_header_prefix_matches_extract_output():
+    js = 'fetch(u, { headers: { "X-Api-Key": k } })'
+    ex = extract(js)
+    from driftjs.curl import headers_from_notable
+    hdrs = dict(headers_from_notable(ex.notable))
+    assert hdrs.get("x-api-key") == "$API_KEY"
+
+
+# ---- v1.4.0: GraphQL operations + client-side routes ----
+
+def test_graphql_extracts_named_operations():
+    from driftjs.graphql import find_graphql_ops
+    ops = find_graphql_ops('const q = gql`query GetUser { user { id } }`;'
+                           'const m = gql`mutation DeleteAccount($id: ID!) { del(id:$id) }`;')
+    assert "query GetUser" in ops
+    assert "mutation DeleteAccount" in ops
+
+
+def test_graphql_silent_on_normal_js():
+    from driftjs.graphql import find_graphql_ops
+    benign = ('db.query(sql); const mutation = useMutation(); '
+              'new MutationObserver(cb); el.querySelector(".x"); subscription.unsubscribe();')
+    assert find_graphql_ops(benign) == set()
+
+
+def test_graphql_ignores_anonymous_and_lowercase():
+    from driftjs.graphql import find_graphql_ops
+    assert find_graphql_ops("query { me }") == set()
+    assert find_graphql_ops("mutation doThing { x }") == set()
+
+
+def test_routes_extracted_only_with_router_present():
+    from driftjs.routes import find_routes
+    js = ('import { createBrowserRouter } from "react-router-dom";'
+          'const r = [{ path: "/admin/settings", element: <A/> },'
+          '{ path: "/billing", element: <B/> }];')
+    routes = find_routes(js)
+    assert "/admin/settings" in routes
+    assert "/billing" in routes
+
+
+def test_routes_jsx_form():
+    from driftjs.routes import find_routes
+    js = '<Routes><Route path="/dashboard" element={<D/>}/><Route path="/users/:id" element={<U/>}/></Routes>'
+    routes = find_routes(js)
+    assert "/dashboard" in routes
+    assert "/users/:id" in routes
+
+
+def test_routes_silent_without_router_fingerprint():
+    from driftjs.routes import find_routes
+    assert find_routes('const cfg = { path: "/etc/passwd" }; obj.path = "/whatever";') == set()
+
+
+def test_routes_filters_asset_paths():
+    from driftjs.routes import find_routes
+    js = 'createBrowserRouter([{ path: "/logo.svg" }, { path: "/app.js" }, { path: "/admin" }])'
+    routes = find_routes(js)
+    assert routes == {"/admin"}
+
+
+def test_extract_populates_graphql_and_routes():
+    js = ('import "react-router-dom"; createBrowserRouter([{path:"/admin",element:x}]);'
+          'const q = `query Me { me { id } }`; const m = `mutation Ban { ban }`;')
+    ex = extract(js)
+    assert "/admin" in ex.routes
+    assert "query Me" in ex.graphql_ops
+    assert "mutation Ban" in ex.graphql_ops
+
+
+def test_new_categories_survive_snapshot_roundtrip(tmp_path):
+    from driftjs.snapshot import save_snapshot, load_latest
+    from driftjs.extract import Extraction
+    ex = Extraction(graphql_ops={"mutation Ban"}, routes={"/admin"})
+    save_snapshot(str(tmp_path), "t.example.com", ex)
+    loaded = load_latest(str(tmp_path), "t.example.com")
+    assert loaded.graphql_ops == {"mutation Ban"}
+    assert loaded.routes == {"/admin"}
+
+
+def test_router_config_keys_not_treated_as_params():
+    js = 'createBrowserRouter([{ path: "/admin", element: A, loader: fn, lazy: g }])'
+    ex = extract(js)
+    for k in ("path", "element", "loader", "lazy"):
+        assert k not in ex.params, f"router key leaked as param: {k}"
+
+
+def test_real_path_query_param_still_survives():
+    ex = extract('fetch("/download?path=../../etc/passwd")')
+    assert "path" in ex.params
